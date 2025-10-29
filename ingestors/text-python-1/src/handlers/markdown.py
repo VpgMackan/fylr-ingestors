@@ -13,13 +13,11 @@ def handle_markdown(file_content: bytes, **kwargs) -> str:
         Extracted text as string
     """
     try:
-        # Try UTF-8 first, fall back to latin-1 if that fails
         try:
             text = file_content.decode('utf-8')
         except UnicodeDecodeError:
             text = file_content.decode('latin-1')
         
-        # Remove any null bytes and normalize whitespace
         text = text.replace('\x00', '')
         
         return text.strip()

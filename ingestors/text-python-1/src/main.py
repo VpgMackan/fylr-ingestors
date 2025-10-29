@@ -3,55 +3,77 @@ import pika
 import sys
 import json
 import boto3
-from sentence_transformers import SentenceTransformer
+import requests
+from botocore.config import Config
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from dotenv import load_dotenv
+
 from handlers import HandlerManager
+from database import get_db_session, Source, DocumentVector
+
+load_dotenv()
 
 ROUTING_KEYS_STR = os.getenv("INGESTOR_ROUTING_KEYS")
 QUEUE_NAME = os.getenv("INGESTOR_QUEUE_NAME")
 EXCHANGE_NAME = "file-processing-exchange"
+EVENTS_EXCHANGE_NAME = "fylr-events"
+
 RABBITMQ_HOST = os.getenv("RABBITMQ_HOST", "localhost")
 RABBITMQ_PORT = int(os.getenv("RABBITMQ_PORT", "5672"))
 RABBITMQ_USER = os.getenv("RABBITMQ_USER", "guest")
 RABBITMQ_PASSWORD = os.getenv("RABBITMQ_PASSWORD", "guest")
-AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
-S3_BUCKET = os.getenv("S3_BUCKET")
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
 
-if not ROUTING_KEYS_STR or not QUEUE_NAME:
-    sys.exit("Error: INGESTOR_ROUTING_KEYS and INGESTOR_QUEUE_NAME must be set.")
+S3_ENDPOINT = os.getenv("S3_ENDPOINT")
+S3_PORT = os.getenv("S3_PORT")
+S3_KEY_ID = os.getenv("S3_KEY_ID")
+S3_SECRET_KEY = os.getenv("S3_SECRET_KEY")
+S3_REGION = os.getenv("S3_REGION")
+S3_BUCKET_USER_FILE = os.getenv("S3_BUCKET_USER_FILE")
 
-if not S3_BUCKET:
-    sys.exit("Error: S3_BUCKET must be set.")
+AI_GATEWAY_URL = os.getenv("AI_GATEWAY_URL")
+
+if not all([ROUTING_KEYS_STR, QUEUE_NAME, S3_BUCKET_USER_FILE, AI_GATEWAY_URL]):
+    sys.exit("Error: Missing one or more required environment variables.")
 
 ROUTING_KEYS = [key.strip() for key in ROUTING_KEYS_STR.split(",")]
 handler_manager = HandlerManager()
 
-# Initialize S3 client
-s3_client = boto3.client("s3", region_name=AWS_REGION)
+s3 = boto3.resource(
+    "s3",
+    aws_access_key_id=S3_KEY_ID,
+    aws_secret_access_key=S3_SECRET_KEY,
+    region_name=S3_REGION,
+    endpoint_url=f"http://{S3_ENDPOINT}:{S3_PORT}",
+    config=Config(s3={"addressing_style": "path"}),
+)
+s3_bucket = s3.Bucket(S3_BUCKET_USER_FILE)
 
-# Initialize embedding model
-print(f"Loading embedding model: {EMBEDDING_MODEL}")
-embedding_model = SentenceTransformer(EMBEDDING_MODEL)
-print("Embedding model loaded successfully")
-
-
-def download_from_s3(s3_key: str) -> bytes:
-    """Download file from S3."""
-    try:
-        response = s3_client.get_object(Bucket=S3_BUCKET, Key=s3_key)
-        return response["Body"].read()
-    except Exception as e:
-        raise Exception(f"Failed to download file from S3: {e}")
+text_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=1000, chunk_overlap=200, add_start_index=True
+)
 
 
-def publish_status(channel, source_id: str, status: str, message: str = ""):
-    """Publish status update to RabbitMQ."""
-    status_message = {"sourceId": source_id, "status": status, "message": message}
+def publish_status(channel, job_key, stage, message, error=False):
+    """Publishes a status update to the fylr-events exchange."""
+    payload = {"stage": stage, "message": message, "error": error}
+    routing_key = f"job.{job_key}.status"
     channel.basic_publish(
-        exchange=EXCHANGE_NAME,
-        routing_key="status.update",
-        body=json.dumps(status_message),
+        exchange=EVENTS_EXCHANGE_NAME,
+        routing_key=routing_key,
+        body=json.dumps({"eventName": "jobStatusUpdate", "payload": payload}),
+        properties=pika.BasicProperties(delivery_mode=2),
     )
+    print(f"[{job_key}] Status: {stage} - {message}")
+
+
+def get_embeddings(chunks: list[str], model: str) -> list[list[float]]:
+    """Calls the AI Gateway to get embeddings."""
+    response = requests.post(
+        f"{AI_GATEWAY_URL}/v1/embeddings",
+        json={"provider": "jina", "model": model, "input": chunks},
+    )
+    response.raise_for_status()
+    return [item["embedding"] for item in response.json()["data"]]
 
 
 def main():
@@ -66,87 +88,93 @@ def main():
     channel.exchange_declare(
         exchange=EXCHANGE_NAME, exchange_type="topic", durable=True
     )
+    channel.exchange_declare(
+        exchange=EVENTS_EXCHANGE_NAME, exchange_type="topic", durable=True
+    )
     channel.queue_declare(queue=QUEUE_NAME, durable=True)
 
-    for routing_key in ROUTING_KEYS:
-        channel.queue_bind(
-            exchange=EXCHANGE_NAME, queue=QUEUE_NAME, routing_key=routing_key
-        )
-        print(f"Binding queue '{QUEUE_NAME}' to routing key '{routing_key}'")
+    for rk in ROUTING_KEYS:
+        channel.queue_bind(exchange=EXCHANGE_NAME, queue=QUEUE_NAME, routing_key=rk)
+        print(f"Binding queue '{QUEUE_NAME}' to routing key '{rk}'")
 
-    print(f"Ingestor online. Listening for jobs on queue '{QUEUE_NAME}'...")
+    print(f"Ingestor online. Listening on queue '{QUEUE_NAME}'...")
 
     def callback(ch, method, properties, body):
-        routing_key = method.routing_key
         message = json.loads(body)
-        mime_type = message.get("mimeType")
         source_id = message.get("sourceId")
         s3_key = message.get("s3Key")
-
-        print(
-            f"Received message with routing key '{routing_key}' for source {source_id}"
-        )
+        mime_type = message.get("mimeType")
+        job_key = message.get("jobKey")
+        embedding_model = message.get("embeddingModel")
 
         try:
-            # Update status to PROCESSING
-            publish_status(ch, source_id, "PROCESSING", "Starting text extraction")
+            publish_status(ch, job_key, "STARTING", "Processing started.")
 
-            # 1. Download file from S3
-            print(f"Downloading file from S3: {s3_key}")
-            file_content = download_from_s3(s3_key)
+            # 1. Download from S3
+            publish_status(ch, job_key, "FETCHING", "Downloading file from storage.")
+            obj = s3_bucket.Object(s3_key)
+            file_content = obj.get()["Body"].read()
 
-            # 2. Extract text using appropriate handler
-            print(f"Extracting text using handler for mime type: {mime_type}")
-            extracted_text = handler_manager.process_data(mime_type, file_content)
+            # 2. Extract Text
+            publish_status(ch, job_key, "PARSING", f"Parsing {mime_type} file.")
+            text = handler_manager.process_data(mime_type, file_content)
+            if not text or not text.strip():
+                raise ValueError("No text could be extracted from the file.")
 
-            if not extracted_text:
-                raise ValueError("No text content extracted from file")
-
-            print(f"Extracted {len(extracted_text)} characters of text")
-
-            # 3. Generate embeddings
-            print("Generating embeddings...")
-            publish_status(ch, source_id, "PROCESSING", "Generating embeddings")
-
-            # Split text into chunks (simple approach - you might want more sophisticated chunking)
-            chunk_size = 500
-            chunks = []
-            for i in range(0, len(extracted_text), chunk_size):
-                chunk = extracted_text[i : i + chunk_size]
-                if chunk.strip():
-                    chunks.append(chunk)
-
-            print(f"Split text into {len(chunks)} chunks")
-
-            # Generate embeddings for each chunk
-            embeddings = embedding_model.encode(chunks)
-            print(f"Generated {len(embeddings)} embeddings")
-
-            # 4. Save to database (placeholder - you'll need to implement your DB logic)
-            # For now, we'll just log what would be saved
-            print(
-                f"Would save {len(chunks)} chunks with embeddings to database for source {source_id}"
-            )
-            # Example structure:
-            # for idx, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
-            #     save_to_db(source_id, idx, chunk, embedding.tolist())
-
-            # Update status to COMPLETED
+            # 3. Chunk Text
+            docs = text_splitter.create_documents([text])
+            chunks = [doc.page_content for doc in docs]
             publish_status(
-                ch,
-                source_id,
-                "COMPLETED",
-                f"Successfully processed {len(chunks)} text chunks",
+                ch, job_key, "VECTORIZING", f"Split text into {len(chunks)} chunks."
             )
-            print(f"Successfully processed message for mime_type: {mime_type}")
 
+            # 4. Get Embeddings
+            embeddings = get_embeddings(chunks, embedding_model)
+            if len(embeddings) != len(chunks):
+                raise Exception("Mismatch between number of chunks and embeddings.")
+
+            # 5. Save to Database
+            with get_db_session() as db:
+                db.query(DocumentVector).filter(
+                    DocumentVector.file_id == source_id
+                ).delete()
+
+                vectors = []
+                for i, doc in enumerate(docs):
+                    vectors.append(
+                        DocumentVector(
+                            id=f"vec_{source_id}_{i}",
+                            file_id=source_id,
+                            content=doc.page_content,
+                            embedding=embeddings[i],
+                            chunk_index=doc.metadata.get("start_index", i),
+                        )
+                    )
+
+                db.add_all(vectors)
+
+                source = db.query(Source).filter(Source.id == source_id).one()
+                source.status = "COMPLETED"
+                source.ingestor_type = "text-python"
+                source.ingestor_version = "1.0.0"
+
+            publish_status(
+                ch, job_key, "COMPLETED", "Processing finished successfully."
+            )
             ch.basic_ack(delivery_tag=method.delivery_tag)
+
         except Exception as e:
-            error_msg = f"Error processing message: {e}"
-            print(error_msg)
-            publish_status(ch, source_id, "FAILED", str(e))
+            print(
+                f"Error processing message for source {source_id}: {e}", file=sys.stderr
+            )
+            publish_status(ch, job_key, "FAILED", str(e), error=True)
+            with get_db_session() as db:
+                source = db.query(Source).filter(Source.id == source_id).first()
+                if source:
+                    source.status = "FAILED"
             ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
 
+    channel.basic_qos(prefetch_count=1)
     channel.basic_consume(queue=QUEUE_NAME, on_message_callback=callback)
     channel.start_consuming()
 

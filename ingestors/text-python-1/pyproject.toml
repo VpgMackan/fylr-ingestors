@@ -1,19 +1,28 @@
-[project]
-name = "text-python-1-ingestor"
-version = "0.1.0"
-description = "Text ingestor for PDF, Markdown, and plain text files"
-requires-python = ">=3.9"
-dependencies = [
-    "pika>=1.3.0",
-    "boto3>=1.26.0",
-    "sentence-transformers>=2.2.0",
-    "pypdf>=3.17.0",
-]
+[tool.poetry]
+name = "ingestor-text-python"
+version = "1.0.0"
+description = "Text ingestor for PDF, Markdown, and plain text files for Fylr"
+authors = ["Your Name <you@example.com>"]
+readme = "README.md"
+packages = [{ include = "src" }]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+pika = "^1.3.2"
+boto3 = "^1.34.0"
+python-dotenv = "^1.0.0"
+pydantic-settings = "^2.2.1"
+sqlalchemy = "^2.0.25"
+psycopg2-binary = "^2.9.9"
+pgvector = "^0.2.0"
+langchain-text-splitters = "^0.0.1"
+pymupdf = "^1.23.21"
+requests = "^2.31.0"
+structlog = "^24.1.0"
+
+[tool.poetry.scripts]
+start = "src.main:main"
 
 [build-system]
-requires = ["setuptools>=61.0"]
-build-backend = "setuptools.build_meta"
-
-[tool.setuptools]
-packages = ["handlers"]
-package-dir = {"" = "src"}
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
