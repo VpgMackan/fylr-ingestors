@@ -1,0 +1,19 @@
+[project]
+name = "text-python-1-ingestor"
+version = "0.1.0"
+description = "Text ingestor for PDF, Markdown, and plain text files"
+requires-python = ">=3.9"
+dependencies = [
+    "pika>=1.3.0",
+    "boto3>=1.26.0",
+    "sentence-transformers>=2.2.0",
+    "pypdf>=3.17.0",
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["handlers"]
+package-dir = {"" = "src"}
